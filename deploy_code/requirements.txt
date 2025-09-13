@@ -1,12 +1,6 @@
 streamlit==1.36.0
-requests==2.32.3
-
-numpy==1.24.4
-scipy==1.10.1
-scikit-learn==1.2.2
-joblib==1.2.0
-threadpoolctl==3.1.0
-
-ortools==9.9.3963
-protobuf==4.25.5
-absl-py==2.1.0
+numpy==1.26.4
+scikit-learn==1.4.2
+ortools==9.10.4067
+requests>=2.31.0
+protobuf>=4.21.12,<5
