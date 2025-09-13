@@ -1,90 +1,68 @@
-# ===================== Streamlit Cloud–friendly build ======================
-# Features:
-# - Places (New) autocomplete + details (HTTP)
-# - KMeans clustering
-# - VRPTW per cluster (OR-Tools), with safe parameters + heuristic fallback
-# - TSP fallback (pure Python heuristic) when no TW or infeasible
-# - Priced time-slot offers per run for a new address
-# - Google Routes polylines (chunked) + Maps JS render
-# - Works with ONE key (uses same for JS + HTTP) or TWO keys (secrets)
-# - Thread/env caps to reduce native segfaults on Cloud
-
-# -------------------- Set env caps BEFORE heavy imports --------------------
-import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("KMP_AFFINITY", "disabled")
-os.environ.setdefault("KMP_BLOCKTIME", "0")
-os.environ.setdefault("MALLOC_ARENA_MAX", "2")
-os.environ.setdefault("PYTHONFAULTHANDLER", "1")
-
-# -------------------- Standard imports ------------------------------------
-import sys, faulthandler
-faulthandler.enable()
+# app_slots_priced.py
+# - Places (New) autocomplete + details
+# - KMeans clustering (~target/cluster)
+# - TSP per cluster (OR-Tools) or VRPTW per cluster (time windows)
+# - Google route polylines (chunked ≤25 waypoints)
+# - NEW ORDER: Offer PRICED TIME SLOTS (one per run) → book a slot → update ONLY that run
+# - Robust map rendering with forced remounts
+# - Time Windows UI (Priority stops or enforce for all)
+# - Cost model for slot pricing (labour $/h, vehicle $/km, fixed stop)
 
 import json
 import math
 import time
 from typing import List, Dict, Any, Tuple
-from datetime import time as dtime
 
 import numpy as np
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-from sklearn.cluster import KMeans
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from sklearn.cluster import KMeans
+from datetime import time as dtime, datetime, timedelta
 
-# -------------------- App header & keys -----------------------------------
-st.set_page_config(page_title="VRPTW + Priced Time Slots (Cloud Stable)", page_icon="⏱️", layout="wide")
-st.title("⏱️ Cluster + VRPTW + Priced Time Slots (cloud-stable)")
 
-# Keys: support either 2-key setup OR a single key named GOOGLE_API_KEY.
-MAPS_JS_KEY   = st.secrets.get("GOOGLE_MAPS_JS_KEY") or os.getenv("GOOGLE_MAPS_JS_KEY") or ""
-BACKEND_KEY   = st.secrets.get("GOOGLE_BACKEND_KEY") or os.getenv("GOOGLE_BACKEND_KEY") or ""
-SINGLE_KEY    = st.secrets.get("GOOGLE_API_KEY")     or os.getenv("GOOGLE_API_KEY")     or ""
+# =======================
+#  HARD-CODE YOUR API KEY
+# =======================
+API_KEY = (st.secrets.get("GOOGLE_MAPS_API_KEY") 
+           if hasattr(st, "secrets") else None) or os.getenv("GOOGLE_MAPS_API_KEY", "")  # <-- your Google Cloud key (enable Maps JS, Places (New), Routes)
 
-if not MAPS_JS_KEY and SINGLE_KEY:
-    MAPS_JS_KEY = SINGLE_KEY
-if not BACKEND_KEY and SINGLE_KEY:
-    BACKEND_KEY = SINGLE_KEY
-
+# ---------- Google endpoints ----------
 PLACES_AUTOCOMPLETE_V1 = "https://places.googleapis.com/v1/places:autocomplete"
 PLACE_DETAILS_V1_TMPL  = "https://places.googleapis.com/v1/places/{place_id}"
 ROUTES_COMPUTE         = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
-# -------------------- Session state ---------------------------------------
+# ---------- Page ----------
+st.set_page_config(page_title="Clusters + TSP/VRPTW + Priced Time Slots", page_icon="⏱️", layout="wide")
+st.title("⏱️ Cluster + TSP/VRPTW + New order → priced time slots (book & update ONE run)")
+
+# ---------- Session state ----------
 def init_state():
     ss = st.session_state
     ss.setdefault("chosen", [])
     ss.setdefault("suggestions_main", [])
     ss.setdefault("suggestions_new", [])
-    ss.setdefault("clusters", None)       # {'labels','k','target_size','points','sizes','centroids'}
-    ss.setdefault("routes", [])           # [{'cluster','run_id','order','ordered_points','poly_points','steps','arrivals'}]
+    ss.setdefault("clusters", None)     # {'labels','k','target_size','points','sizes','centroids'}
+    ss.setdefault("routes", [])         # [{'cluster','run_id','order','ordered_points','poly_points','steps','arrivals'}]
     ss.setdefault("new_candidate", None)
-    ss.setdefault("slot_options", None)   # slots for new order
+    ss.setdefault("slot_options", None) # [{slot info...}]
     ss.setdefault("bias_au", True)
     ss.setdefault("map_version", 0)
     ss.setdefault("speed_kmh", 40.0)
-
-    # Pricing model
     ss.setdefault("cost_labour_per_h", 40.0)
     ss.setdefault("cost_vehicle_per_km", 0.7)
     ss.setdefault("cost_fixed_stop", 3.0)
     ss.setdefault("slot_len_min", 15)
 
-    # Time windows per place_id
+    # Time windows store per place_id
+    # e.g. tw[place_id] = {"priority": bool, "start_min": int, "end_min": int, "service_min": int}
     ss.setdefault("tw", {})
 init_state()
 
-def dbg(msg: str):
-    print(f"[VRPTW] {msg}", file=sys.stderr, flush=True)
-
-# -------------------- Helpers ---------------------------------------------
+# ---------- Helpers ----------
 def minutes_to_hhmm(day_start_sec: int, secs_from_daystart: int) -> str:
-    t = day_start_sec + int(secs_from_daystart)
+    t = day_start_sec + secs_from_daystart
     hh = (t // 3600) % 24
     mm = (t % 3600) // 60
     return f"{hh:02d}:{mm:02d}"
@@ -115,13 +93,13 @@ def meters_to_seconds(meters: int, speed_kmh: float) -> int:
     speed_mps = max(1e-6, speed_kmh*1000.0/3600.0)
     return int(round(meters/speed_mps))
 
-# -------------------- Google helpers --------------------------------------
+# ---------- Google helpers ----------
 def autocomplete_new(query: str, bias_au: bool, min_chars: int = 3) -> Dict[str, Any]:
-    if not query or len(query) < min_chars or not BACKEND_KEY:
+    if not query or len(query) < min_chars or not API_KEY:
         return {"status": "IDLE", "error": "", "suggestions": []}
     headers = {
         "Content-Type":"application/json",
-        "X-Goog-Api-Key":BACKEND_KEY,
+        "X-Goog-Api-Key":API_KEY,
         "X-Goog-FieldMask":"suggestions.placePrediction.text.text,suggestions.placePrediction.placeId",
     }
     body = {"input": query, "includeQueryPredictions": False}
@@ -147,7 +125,7 @@ def autocomplete_new(query: str, bias_au: bool, min_chars: int = 3) -> Dict[str,
 def place_details_new(place_id: str) -> Dict[str, Any]:
     headers = {
         "Content-Type":"application/json",
-        "X-Goog-Api-Key":BACKEND_KEY,
+        "X-Goog-Api-Key":API_KEY,
         "X-Goog-FieldMask":"id,formattedAddress,location",
     }
     url = PLACE_DETAILS_V1_TMPL.format(place_id=place_id)
@@ -162,29 +140,56 @@ def place_details_new(place_id: str) -> Dict[str, Any]:
             "place_id": data.get("id"),
             "error": ""}
 
-# -------------------- TSP (fallback) --------------------------------------
-def tsp_fast_order(points_ll, route_type="loop"):
+# ---------- TSP ----------
+def tsp_solve_order(points_ll: List[Tuple[float,float]], route_type: str="loop") -> List[int]:
     n = len(points_ll)
     if n <= 1: return list(range(n))
-    D = build_distance_matrix_m(points_ll)
     clat = sum(p[0] for p in points_ll)/n
     clng = sum(p[1] for p in points_ll)/n
-    start = min(range(n), key=lambda i: (points_ll[i][0]-clat)**2 + (points_ll[i][1]-clng)**2)
-    unv = set(range(n)); unv.remove(start)
-    path = [start]; cur = start
-    while unv:
-        nxt = min(unv, key=lambda j: D[cur][j]); unv.remove(nxt); path.append(nxt); cur = nxt
-    if route_type == "loop": path = path + [path[0]]
-    return path
+    start_idx = min(range(n), key=lambda i: (points_ll[i][0]-clat)**2+(points_ll[i][1]-clng)**2)
 
-# -------------------- VRPTW (OR-Tools) + heuristic fallback ---------------
-def vrptw_ortools(points_ll, service_sec, tw_start_sec, tw_end_sec,
-                  route_type, speed_kmh, horizon_sec, time_limit_sec=12):
-    """Single-vehicle VRPTW via OR-Tools (guarded). Returns (order, arrivals) or ([], [])."""
+    end_idx = start_idx
+    if route_type == "path":
+        end_idx = max(range(n), key=lambda i:(points_ll[i][0]-points_ll[start_idx][0])**2+(points_ll[i][1]-points_ll[start_idx][1])**2)
+        if end_idx == start_idx and n>1: end_idx=(start_idx+1)%n
+
+    M = build_distance_matrix_m(points_ll)
+    manager = pywrapcp.RoutingIndexManager(n,1,[start_idx],[start_idx] if route_type=="loop" else [end_idx])
+    routing = pywrapcp.RoutingModel(manager)
+
+    def cb(i,j):
+        a = manager.IndexToNode(i); b = manager.IndexToNode(j)
+        return M[a][b]
+    transit = routing.RegisterTransitCallback(cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit)
+
+    p = pywrapcp.DefaultRoutingSearchParameters()
+    p.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    p.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    p.time_limit.FromSeconds(5)
+
+    sol = routing.SolveWithParameters(p)
+    if not sol:
+        rem=set(range(n)); order=[start_idx]; rem.remove(start_idx); cur=start_idx
+        while rem:
+            nxt=min(rem, key=lambda j:M[cur][j]); order.append(nxt); rem.remove(nxt); cur=nxt
+        if route_type=="loop": order.append(start_idx)
+        return order
+
+    idx = routing.Start(0); order=[]
+    while not routing.IsEnd(idx):
+        order.append(manager.IndexToNode(idx))
+        idx = sol.Value(routing.NextVar(idx))
+    order.append(manager.IndexToNode(idx))
+    return order
+
+# ---------- VRPTW (single-vehicle with time windows) ----------
+def solve_with_time_windows(points_ll, service_sec, tw_start_sec, tw_end_sec, route_type, speed_kmh, horizon_sec, time_limit_sec=15):
     n=len(points_ll)
     if n<=1: return list(range(n)), [0]
     D = build_distance_matrix_m(points_ll)
     T = [[meters_to_seconds(D[i][j], speed_kmh) for j in range(n)] for i in range(n)]
+    # start at earliest window node; end at latest (or start if loop)
     start_idx = int(np.argmin(tw_start_sec))
     end_idx   = start_idx if route_type=="loop" else int(np.argmax(tw_end_sec))
     if route_type=="path" and end_idx==start_idx and n>1: end_idx=(start_idx+1)%n
@@ -203,17 +208,17 @@ def vrptw_ortools(points_ll, service_sec, tw_start_sec, tw_end_sec,
     time_dim = routing.GetDimensionOrDie(dim)
     time_dim.SetSpanCostCoefficientForAllVehicles(1)
 
-    # Normalize windows
+    def set_range(idx, lb, ub):
+        if idx is None or idx<0: return
+        v = time_dim.CumulVar(idx)
+        if v is not None: v.SetRange(int(lb), int(ub))
+
+    # Normalize window bounds
     ns=[]; ne=[]
     for s,e in zip(tw_start_sec, tw_end_sec):
         s2=max(0,int(s)); e2=int(horizon_sec if e is None else e)
         if e2 < s2: s2, e2 = 0, int(horizon_sec)
         ns.append(s2); ne.append(e2)
-
-    def set_range(routing_index, lb, ub):
-        if routing_index is None or routing_index<0: return
-        v = time_dim.CumulVar(routing_index)
-        if v is not None: v.SetRange(int(lb), int(ub))
 
     for node in range(n):
         if node==start_idx: continue
@@ -223,21 +228,14 @@ def vrptw_ortools(points_ll, service_sec, tw_start_sec, tw_end_sec,
     set_range(routing.End(0),   0, horizon_sec)
 
     for node in range(n):
-        v = time_dim.CumulVar(manager.NodeToIndex(node))
-        routing.AddVariableMinimizedByFinalizer(v)
+        idx = manager.NodeToIndex(node); v = time_dim.CumulVar(idx)
+        if v is not None: routing.AddVariableMinimizedByFinalizer(v)
 
     p = pywrapcp.DefaultRoutingSearchParameters()
-    p.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    p.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.AUTOMATIC
+    p.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    p.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     p.time_limit.FromSeconds(time_limit_sec)
-
-    try:
-        dbg(f"VRPTW OR-Tools: n={n}, horizon={horizon_sec}, route_type={route_type}")
-        sol = routing.SolveWithParameters(p)
-    except Exception as e:
-        dbg(f"VRPTW OR-Tools exception: {e}")
-        return [], []
-
+    sol = routing.SolveWithParameters(p)
     if not sol: return [], []
 
     idx = routing.Start(0); order, arrivals = [], []
@@ -249,45 +247,7 @@ def vrptw_ortools(points_ll, service_sec, tw_start_sec, tw_end_sec,
     order.append(node); arrivals.append(sol.Value(time_dim.CumulVar(idx)))
     return order, arrivals
 
-def vrptw_greedy(points_ll, service_sec, tw_start_sec, tw_end_sec,
-                 route_type, speed_kmh, horizon_sec):
-    """Fast pure-Python fallback (earliest-due-date + min added time)."""
-    n = len(points_ll)
-    if n == 0: return [], []
-    if n == 1: return ([0,0] if route_type=="loop" else [0], [0,0] if route_type=="loop" else [0])
-
-    D = build_distance_matrix_m(points_ll)
-    T = [[meters_to_seconds(D[i][j], speed_kmh) for j in range(n)] for i in range(n)]
-    ns = [max(0, int(s)) for s in tw_start_sec]
-    ne = [int(horizon_sec if e is None else e) for e in tw_end_sec]
-
-    start = int(np.argmin(ns))
-    order = [start]; t = max(0, ns[start]); arrivals=[int(t)]
-    t += int(service_sec[start]); cur = start
-    unv = set(range(n)); unv.remove(start)
-
-    while unv:
-        best=None; best_key=None; best_arr=None
-        for j in unv:
-            arr = t + T[cur][j]
-            if arr < ns[j]: arr = ns[j]
-            if arr > ne[j]: continue
-            added = arr + service_sec[j] - t
-            key = (ne[j], added)
-            if best is None or key < best_key:
-                best=j; best_key=key; best_arr=arr
-        if best is None: return [], []
-        cur=best; unv.remove(best); order.append(best); arrivals.append(int(best_arr))
-        t = int(best_arr + service_sec[best])
-        if t > horizon_sec: return [], []
-
-    if route_type == "loop":
-        arrivals.append(int(t))  # arrival back to start (approx)
-        order.append(order[0])
-
-    return order, arrivals
-
-# -------------------- Route metrics (simulation) ---------------------------
+# ---------- Route metrics (Euclidean-based) ----------
 def route_metrics(points_ll: List[Tuple[float,float]],
                   order_idxs: List[int],
                   service_sec: List[int],
@@ -295,27 +255,46 @@ def route_metrics(points_ll: List[Tuple[float,float]],
                   tw_end_sec: List[int],
                   route_type: str,
                   speed_kmh: float) -> Tuple[int, int, List[int]]:
-    if not order_idxs: return 0, 0, []
+    """
+    Greedy simulation to estimate total route seconds (incl. waiting) and travel meters.
+    Returns: (total_seconds, travel_meters, arrivals_list)
+    """
+    if not order_idxs:
+        return 0, 0, []
+    # Distance matrix
     D = build_distance_matrix_m(points_ll)
+    # Normalize windows
+    n = len(points_ll)
     ns = [max(0,int(s)) for s in tw_start_sec]
     ne = [int(e if e is not None else 10**9) for e in tw_end_sec]
+
+    # Copy order; ensure if loop that end duplicates start
     order = list(order_idxs)
     if route_type == "loop" and (len(order) < 2 or order[0] != order[-1]):
         order = order + [order[0]]
-    t = 0; travel_m = 0; arrivals = []
+
+    t = 0
+    travel_m = 0
+    arrivals = []
     for k in range(len(order)):
         i = order[k]
-        if t < ns[i]: t = ns[i]
+        # arrival time already t (from previous leg)
+        # Window wait
+        if t < ns[i]:
+            t = ns[i]  # wait until window opens
         arrivals.append(int(t))
-        if k == len(order)-1 and route_type=="loop" and i==order[0]:
-            break
+        # Service
         t += int(service_sec[i])
+        # Travel to next (if any)
         if k < len(order)-1:
             j = order[k+1]
-            dm = D[i][j]; travel_m += dm; t += meters_to_seconds(dm, speed_kmh)
-    return int(t), int(travel_m), arrivals
+            dm = D[i][j]
+            travel_m += dm
+            t += meters_to_seconds(dm, speed_kmh)
+    total_seconds = int(t)
+    return total_seconds, int(travel_m), arrivals
 
-# -------------------- Polylines (Routes API) ------------------------------
+# ---------- Polyline (chunked) ----------
 def decode_polyline(enc: str) -> List[Tuple[float,float]]:
     pts=[]; idx=0; lat=0; lng=0
     while idx < len(enc):
@@ -335,10 +314,10 @@ def decode_polyline(enc: str) -> List[Tuple[float,float]]:
     return pts
 
 def _compute_polyline_one(origin, destination, inters):
-    if not BACKEND_KEY: return [], []
+    if not API_KEY: return [], []
     headers = {
         "Content-Type":"application/json",
-        "X-Goog-Api-Key":BACKEND_KEY,
+        "X-Goog-Api-Key":API_KEY,
         "X-Goog-FieldMask":"routes.polyline.encodedPolyline,routes.legs.steps.navigationInstruction",
     }
     body = {
@@ -384,7 +363,7 @@ def compute_google_route_polyline_chunked(seq_ll: List[Tuple[float,float]]) -> T
         start=end
     return result_pts, result_steps
 
-# -------------------- Map renderer (Maps JS) ------------------------------
+# ---------- Robust map renderer ----------
 def render_google_map(markers, polylines, center_lat, center_lng, api_key, map_version, height_px=650):
     mv = int(map_version); ts = int(time.time()); map_div_id = "map_canvas"
     html = f"""
@@ -442,7 +421,7 @@ def render_google_map(markers, polylines, center_lat, center_lng, api_key, map_v
     cache_bust = f"<!-- cache_bust:{mv}_{ts}_{len(markers)}_{sum(len(pl.get('path',[])) for pl in polylines)} -->"
     components.html(html + cache_bust, height=height_px, scrolling=False)
 
-# -------------------- Sidebar --------------------------------------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Options")
     st.session_state.bias_au = st.checkbox("Bias Autocomplete to Australia", value=st.session_state.bias_au)
@@ -450,47 +429,43 @@ with st.sidebar:
     random_state  = st.number_input("Random seed", 0, 9999, 42, 1)
     route_type    = st.selectbox("Route type (base runs)", ["Return to start (loop)", "End at farthest (open path)"], 0)
     route_type_key= "loop" if route_type.startswith("Return") else "path"
-    st.session_state.speed_kmh = float(st.number_input("Avg speed (km/h)", 10, 120, int(st.session_state.speed_kmh), 1))
+    st.session_state.speed_kmh = float(st.number_input("Avg speed (for scoring & VRPTW)", 10, 120, int(st.session_state.speed_kmh), 1))
 
     st.divider()
     st.subheader("Time windows")
     default_service_min = st.number_input("Default service time (min)", 0, 120, 5)
     day_start           = st.time_input("Route starts at", value=dtime(8, 0))
     horizon_hours       = st.number_input("Time horizon (hours)", 1, 24, 12)
-    enforce_all_tw      = st.checkbox("Always enforce TWs", value=True)
+    enforce_all_tw      = st.checkbox("Always enforce time windows", value=False)
     st.caption("If OFF: only Priority stops enforce windows. If ON: all stops use their windows.")
 
     st.divider()
-    st.subheader("Cost model (slot pricing)")
+    st.subheader("Cost model (for slot pricing)")
     st.session_state.cost_labour_per_h   = float(st.number_input("Labour $/hour", 0.0, 500.0, float(st.session_state.cost_labour_per_h), 1.0, format="%.2f"))
     st.session_state.cost_vehicle_per_km = float(st.number_input("Vehicle $/km", 0.0, 10.0, float(st.session_state.cost_vehicle_per_km), 0.1, format="%.2f"))
     st.session_state.cost_fixed_stop     = float(st.number_input("Fixed cost per stop", 0.0, 200.0, float(st.session_state.cost_fixed_stop), 1.0, format="%.2f"))
     st.session_state.slot_len_min        = int(st.number_input("Display slot length (min)", 5, 60, int(st.session_state.slot_len_min), 5))
 
     st.divider()
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("Force map refresh"):
-            st.session_state.map_version += 1
-    with colB:
-        if st.button("Clear all"):
-            st.session_state.chosen = []
-            st.session_state.suggestions_main = []
-            st.session_state.suggestions_new = []
-            st.session_state.clusters = None
-            st.session_state.routes = []
-            st.session_state.new_candidate = None
-            st.session_state.slot_options = None
-            st.session_state.tw = {}
-            st.session_state.map_version += 1
+    if st.button("Clear all"):
+        st.session_state.chosen = []
+        st.session_state.suggestions_main = []
+        st.session_state.suggestions_new = []
+        st.session_state.clusters = None
+        st.session_state.routes = []
+        st.session_state.new_candidate = None
+        st.session_state.slot_options = None
+        st.session_state.tw = {}
+        st.session_state.map_version += 1
+        st.rerun()
 
-if not BACKEND_KEY or not MAPS_JS_KEY:
-    st.info("Add **GOOGLE_BACKEND_KEY** (Places + Routes) and **GOOGLE_MAPS_JS_KEY** (Maps JS) to secrets. If you only have one key, set **GOOGLE_API_KEY** and it will be used for both.")
+if not API_KEY:
+    st.info("Add your **Google API key** to enable Autocomplete/Details/Routes.")
 
 day_start_sec = int(day_start.hour*3600 + day_start.minute*60)
 horizon_sec   = int(horizon_hours*3600)
 
-# -------------------- 1) Search & pick -----------------------------------
+# ---------- 1) Search & pick ----------
 st.subheader("1) Search and pick locations")
 with st.form("place_search"):
     q = st.text_input("Search place", placeholder="e.g., 699 Collins St, Docklands VIC 3008")
@@ -503,7 +478,7 @@ if submitted:
 
 if st.session_state.suggestions_main:
     labels = [s["label"] for s in st.session_state.suggestions_main]
-    pick = st.selectbox("Suggestions", labels, index=0, key="pick_main")
+    pick = st.selectbox("Suggestions", labels, index=0)
     if pick:
         sel = next((s for s in st.session_state.suggestions_main if s["label"] == pick), None)
         if sel:
@@ -516,13 +491,20 @@ if st.session_state.suggestions_main:
                 st.write(f"Lat/Lng: {det['lat']}, {det['lng']}")
                 if st.button("➕ Add to list"):
                     st.session_state.chosen = list(st.session_state.chosen) + [det]
+                    # Default TW for this stop
                     pid = det.get("place_id")
-                    st.session_state.tw.setdefault(pid, {"priority": False, "start_min": 9*60, "end_min": 12*60, "service_min": default_service_min})
+                    st.session_state.tw.setdefault(pid, {
+                        "priority": False,
+                        "start_min": 9*60,
+                        "end_min":   12*60,
+                        "service_min": default_service_min
+                    })
                     st.session_state.clusters = None
                     st.session_state.routes = []
                     st.session_state.map_version += 1
+                    st.rerun()
 
-# -------------------- 2) Chosen + Time Windows ----------------------------
+# ---------- 2) Chosen + Time Windows ----------
 st.subheader("2) Chosen locations & Time Windows")
 if not st.session_state.chosen:
     st.info("No locations yet.")
@@ -538,6 +520,7 @@ else:
             st.session_state.clusters = None
             st.session_state.routes = []
             st.session_state.map_version += 1
+            st.rerun()
     with c2:
         if st.button("Clear list"):
             st.session_state.chosen = []
@@ -545,6 +528,7 @@ else:
             st.session_state.clusters = None
             st.session_state.routes = []
             st.session_state.map_version += 1
+            st.rerun()
 
     st.markdown("**Set windows (Priority enforced if global toggle OFF; otherwise all enforced).**")
     for c in st.session_state.chosen:
@@ -566,7 +550,7 @@ else:
                 cfg["service_min"]=st.number_input("Service (min)",0,120,int(cfg.get("service_min",default_service_min)), key=f"svc_{pid}")
             st.session_state.tw[pid]=cfg
 
-# -------------------- 3) Cluster -----------------------------------------
+# ---------- 3) Cluster ----------
 st.subheader("3) Cluster — Aim for ~target points per cluster")
 if st.session_state.chosen and st.button("Run clustering"):
     pts_ll = np.array([[c["lat"], c["lng"]] for c in st.session_state.chosen], float)
@@ -593,9 +577,10 @@ if st.session_state.chosen and st.button("Run clustering"):
     st.session_state.routes = []
     st.session_state.map_version += 1
     st.success(f"Clustering complete: K={k}")
+    st.rerun()
 
-# -------------------- 4) Base runs (VRPTW/TSP + polylines) ----------------
-st.subheader("4) Make base runs — VRPTW/TSP per cluster + Google polylines")
+# ---------- 4) Make base runs (TSP or VRPTW per cluster) ----------
+st.subheader("4) Make base runs — TSP/VRPTW per cluster + Google polylines")
 clusters = st.session_state.clusters
 if clusters and st.button("Solve routes per cluster"):
     pts = clusters["points"]; labs = clusters["labels"]; k = clusters["k"]
@@ -611,36 +596,34 @@ if clusters and st.button("Solve routes per cluster"):
         cl_pts = [pts[i] for i in idxs]
         cl_ll  = [(p["lat"], p["lng"]) for p in cl_pts]
 
+        # Decide whether to enforce windows (global ON, or any Priority present)
         pri_present = any((st.session_state.tw.get(p.get("place_id","")) or {}).get("priority", False) for p in cl_pts)
         enforce_windows = enforce_all_tw or pri_present
 
         svc,tws,twe=[],[],[]
         for p in cl_pts:
-            cfg = st.session_state.tw.get(p.get("place_id","")) or {}
-            svc.append(int(cfg.get("service_min", default_service_min))*60)
-            if enforce_windows:
-                tws.append(max(0, cfg.get("start_min", 9*60)*60))
-                twe.append(max(0, cfg.get("end_min", 12*60)*60))
+            cfg = st.session_state.tw.get(p.get("place_id",""))
+            if cfg:
+                svc.append(int(cfg.get("service_min", default_service_min))*60)
+                if enforce_windows:
+                    tws.append(max(0, cfg.get("start_min", 9*60)*60))
+                    twe.append(max(0, cfg.get("end_min", 12*60)*60))
+                else:
+                    tws.append(0); twe.append(horizon_sec)
             else:
-                tws.append(0); twe.append(horizon_sec)
+                svc.append(int(default_service_min)*60); tws.append(0); twe.append(horizon_sec)
 
         if enforce_windows:
-            order_local, arrivals = vrptw_ortools(
+            order_local, arrivals = solve_with_time_windows(
                 cl_ll, svc, tws, twe,
                 "loop" if route_type_key=="loop" else "path",
-                float(st.session_state.speed_kmh), int(horizon_sec), time_limit_sec=12
+                float(st.session_state.speed_kmh), int(horizon_sec)
             )
-            if not order_local:
-                order_local, arrivals = vrptw_greedy(
-                    cl_ll, svc, tws, twe,
-                    "loop" if route_type_key=="loop" else "path",
-                    float(st.session_state.speed_kmh), int(horizon_sec)
-                )
-                if not order_local:
-                    order_local = tsp_fast_order(cl_ll, "loop" if route_type_key=="loop" else "path")
-                    arrivals = []
+            if not order_local:  # fallback to pure TSP
+                order_local = tsp_solve_order(cl_ll, route_type="loop" if route_type_key=="loop" else "path")
+                arrivals = []
         else:
-            order_local = tsp_fast_order(cl_ll, "loop" if route_type_key=="loop" else "path")
+            order_local = tsp_solve_order(cl_ll, route_type="loop" if route_type_key=="loop" else "path")
             arrivals = []
 
         order_global = [idxs[i] for i in order_local]
@@ -653,8 +636,9 @@ if clusters and st.button("Solve routes per cluster"):
     st.session_state.routes = routes
     st.session_state.map_version += 1
     st.success("Base runs created.")
+    st.rerun()
 
-# -------------------- 5) Results & Map -----------------------------------
+# ---------- 5) Results & Map ----------
 st.subheader("5) Results & Map")
 routes   = st.session_state.routes
 clusters = st.session_state.clusters
@@ -672,6 +656,7 @@ if clusters:
     else:
         st.caption("Click **Solve routes per cluster** to make runs first.")
 
+    # Markers + polylines
     pts = clusters["points"]; labs = list(clusters["labels"]); k = clusters["k"]
     if len(labs)<len(pts) and len(labs)>0: labs = labs + [labs[-1]]*(len(pts)-len(labs))
     elif len(labs)>len(pts): labs = labs[:len(pts)]
@@ -702,18 +687,15 @@ if clusters:
     clat=float(np.mean(lats)) if lats else -37.8136
     clng=float(np.mean(lngs)) if lngs else 144.9631
 
-    # (Fixed f-string parens)
-    st.caption(
-        f"DEBUG • runs={len(routes or [])} • points={len(pts)} • markers={len(markers)} "
-        f"• polylines={sum(len(pl.get('path',[])) for pl in polylines)} • map_v={st.session_state.map_version}"
-    )
-    render_google_map(markers, polylines, clat, clng, MAPS_JS_KEY, st.session_state.map_version, height_px=650)
+    st.caption(f"DEBUG • runs={len(routes or [])} • points={len(pts)} • markers={len(markers)} • polylines={sum(len(pl.get('path',[])) for pl in polylines)} • map_v={st.session_state.map_version}")
+    render_google_map(markers, polylines, clat, clng, API_KEY, st.session_state.map_version, height_px=650)
 
-# -------------------- 6) New order → PRICED TIME SLOTS --------------------
+# ---------- 6) New order — PRICED TIME SLOTS (update one run only) ----------
 st.subheader("6) New order → choose a PRICED time slot (updates one run)")
 if not st.session_state.routes:
     st.caption("Make base runs first (section 4), then add a new order here.")
 else:
+    # Stage candidate via autocomplete
     with st.form("new_order_form"):
         q2 = st.text_input("Search new order", placeholder="e.g., New delivery address")
         submitted2 = st.form_submit_button("Get suggestions")
@@ -736,31 +718,37 @@ else:
             st.error(det2["error"])
         else:
             st.session_state.new_candidate = {"address":det2["address"],"lat":float(det2["lat"]),"lng":float(det2["lng"]),"place_id":det2["place_id"]}
+            # Default TW for this staged stop (so if inserted, it has config)
             pid = det2["place_id"]
             st.session_state.tw.setdefault(pid, {"priority": False,"start_min": 9*60,"end_min": 12*60,"service_min": default_service_min})
             st.success(f"Staged new order: {det2['address']}")
 
     cand = st.session_state.new_candidate
 
+    # ---- Pricing helpers
     def money_cost(delta_sec: float, delta_km: float) -> float:
         labour = (delta_sec/3600.0) * float(st.session_state.cost_labour_per_h)
         vehicle = max(0.0, delta_km) * float(st.session_state.cost_vehicle_per_km)
         fixed = float(st.session_state.cost_fixed_stop)
         return max(0.0, labour + vehicle + fixed)
 
+    # ---- Build slots: one per existing run (cluster)
     def build_slots_for_candidate(cand_point: Dict[str,Any]) -> List[Dict[str,Any]]:
         clusters = st.session_state.clusters
         routes   = st.session_state.routes
         pts_all  = clusters["points"]
         labs_all = clusters["labels"]
+        k        = clusters["k"]
 
         slots=[]
         for rr in routes:
             cl_id = int(rr["cluster"])
+            # indices in this cluster
             idxs=[i for i,l in enumerate(labs_all) if int(l)==cl_id]
             cl_pts = [pts_all[i] for i in idxs]
             cl_ll  = [(p["lat"],p["lng"]) for p in cl_pts]
 
+            # enforce windows?
             pri_present = any((st.session_state.tw.get(p.get("place_id","")) or {}).get("priority", False) for p in cl_pts+[cand_point])
             enforce_windows = enforce_all_tw or pri_present
 
@@ -774,15 +762,17 @@ else:
                     twe.append(max(0, cfg.get("end_min", 12*60)*60))
                 else:
                     tws.append(0); twe.append(horizon_sec)
-
+            # Candidate
             cfg_c = st.session_state.tw.get(cand_point.get("place_id","")) or {}
             svc_c = int(cfg_c.get("service_min", default_service_min))*60
             tws_c = max(0, cfg_c.get("start_min", 9*60)*60) if enforce_windows else 0
             twe_c = max(0, cfg_c.get("end_min", 12*60)*60) if enforce_windows else horizon_sec
 
-            # Base metrics from current run
-            base_points = rr["ordered_points"]
+            # Base metrics (current run)
+            base_order_global = rr["order"]
+            base_points = [pts_all[i] for i in base_order_global]
             base_ll     = [(p["lat"],p["lng"]) for p in base_points]
+            # Match TW arrays to base order (using cl_pts mapping)
             svc_base=[]; tws_base=[]; twe_base=[]
             for p in base_points:
                 cfg = st.session_state.tw.get(p.get("place_id","")) or {}
@@ -792,55 +782,52 @@ else:
                     twe_base.append(max(0, cfg.get("end_min", 12*60)*60))
                 else:
                     tws_base.append(0); twe_base.append(horizon_sec)
+
             base_total_sec, base_travel_m, _ = route_metrics(
-                base_ll, list(range(len(base_ll))),
+                base_ll,
+                list(range(len(base_ll))) if (len(base_order_global)>=2 and base_order_global[0]==base_order_global[-1]) else list(range(len(base_ll))),
                 svc_base, tws_base, twe_base,
                 "loop" if route_type_key=="loop" else "path",
                 float(st.session_state.speed_kmh)
             )
 
-            # Solve with candidate included
+            # Try full re-solve with candidate included
             cl_pts_plus = cl_pts + [cand_point]
             cl_ll_plus  = cl_ll + [(cand_point["lat"], cand_point["lng"])]
             svc_plus    = svc + [svc_c]
             tws_plus    = tws + [tws_c]
             twe_plus    = twe + [twe_c]
 
-            order_local, arrivals = vrptw_ortools(
+            order_local, arrivals = solve_with_time_windows(
                 cl_ll_plus, svc_plus, tws_plus, twe_plus,
                 "loop" if route_type_key=="loop" else "path",
-                float(st.session_state.speed_kmh), int(horizon_sec), time_limit_sec=10
+                float(st.session_state.speed_kmh), int(horizon_sec),
+                time_limit_sec=8
             )
-            if not order_local:
-                # Try heuristic fallback (if infeasible with OR-Tools)
-                order_local, arrivals = vrptw_greedy(
-                    cl_ll_plus, svc_plus, tws_plus, twe_plus,
-                    "loop" if route_type_key=="loop" else "path",
-                    float(st.session_state.speed_kmh), int(horizon_sec)
-                )
-                if not order_local:
-                    continue  # no feasible slot in this run
 
-            # Candidate position & arrival
+            if not order_local:
+                # infeasible with TWs; skip this run
+                continue
+
+            # Candidate local index is last (len-1). Find its position in solution:
             cand_local_idx = len(cl_ll_plus)-1
             try:
                 pos_in_sol = order_local.index(cand_local_idx)
                 cand_arrival = int(arrivals[pos_in_sol])
             except ValueError:
+                # Candidate didn't appear? skip
                 continue
 
-            # New route metrics on solved order
+            # New metrics for the solved route (map to the solved order's point list)
             new_points_order = [cl_pts_plus[i] for i in order_local]
             new_ll_order     = [(p["lat"],p["lng"]) for p in new_points_order]
-            svc_new=[]; tws_new=[]; twe_new=[]
-            for p in new_points_order:
-                cfg = (st.session_state.tw.get(p.get("place_id","")) or {})
-                svc_new.append(int(cfg.get("service_min", default_service_min))*60)
-                if enforce_windows:
-                    tws_new.append(max(0, cfg.get("start_min", 9*60)*60))
-                    twe_new.append(max(0, cfg.get("end_min", 12*60)*60))
-                else:
-                    tws_new.append(0); twe_new.append(horizon_sec)
+            svc_new = [ (st.session_state.tw.get(p.get("place_id","")) or {}).get("service_min", default_service_min)*60 for p in new_points_order ]
+            if enforce_windows:
+                tws_new = [ max(0,(st.session_state.tw.get(p.get("place_id","")) or {}).get("start_min", 9*60)*60) for p in new_points_order ]
+                twe_new = [ max(0,(st.session_state.tw.get(p.get("place_id","")) or {}).get("end_min",   12*60)*60) for p in new_points_order ]
+            else:
+                tws_new = [0]*len(new_points_order)
+                twe_new = [horizon_sec]*len(new_points_order)
 
             new_total_sec, new_travel_m, _ = route_metrics(
                 new_ll_order, list(range(len(new_ll_order))),
@@ -851,21 +838,22 @@ else:
 
             delta_sec = max(0, new_total_sec - base_total_sec)
             delta_km  = max(0.0, (new_travel_m - base_travel_m)/1000.0)
-            price     = (delta_sec/3600.0)*float(st.session_state.cost_labour_per_h) \
-                        + delta_km*float(st.session_state.cost_vehicle_per_km) \
-                        + float(st.session_state.cost_fixed_stop)
+            price     = money_cost(delta_sec, delta_km)
 
-            slots.append({
+            # Build slot (one per run)
+            slot_len = int(st.session_state.slot_len_min*60)
+            slot = {
                 "cluster": cl_id,
                 "run_id": int(rr.get("run_id",1)),
                 "price": float(round(price,2)),
                 "delta_sec": int(delta_sec),
                 "delta_km": float(round(delta_km,2)),
                 "arrival_sec": int(cand_arrival),
-                "end_sec": int(cand_arrival + max(60, svc_c)),
-                "order_local_with_cand": order_local,
-                "new_points_order": new_points_order,
-            })
+                "end_sec": int(cand_arrival + max(60, svc_c)),  # service time as slot length
+                "order_local_with_cand": order_local,           # to apply if booked (local to cl_pts_plus)
+                "new_points_order": new_points_order,           # list of dicts (for polyline)
+            }
+            slots.append(slot)
         return slots
 
     if cand:
@@ -876,9 +864,11 @@ else:
                 if not slots:
                     st.warning("No feasible slots found with current time windows. Try relaxing windows or horizon.")
                 else:
+                    # sort by price asc
                     slots.sort(key=lambda x: (x["price"], x["arrival_sec"]))
                     st.session_state.slot_options = slots
                     st.success(f"Built {len(slots)} slot(s). Choose one to book.")
+                    st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
 
         slots = st.session_state.slot_options
         if slots:
@@ -887,10 +877,8 @@ else:
             for i, sl in enumerate(slots):
                 t1 = minutes_to_hhmm(day_start_sec, sl["arrival_sec"])
                 t2 = minutes_to_hhmm(day_start_sec, sl["end_sec"])
-                labels.append(
-                    f"{t1}–{t2}  •  ${sl['price']:.2f}  •  +{int(round(sl['delta_sec']/60.0))} min, +{sl['delta_km']:.2f} km  •  Cluster {sl['cluster']}"
-                )
-            pick_idx=st.selectbox("Pick a slot to book", list(range(len(labels))), format_func=lambda i: labels[i], key="slot_pick")
+                labels.append(f"{t1}–{t2}  •  ${sl['price']:.2f}  •  +{int(round(sl['delta_sec']/60.0))} min, +{sl['delta_km']} km  •  Cluster {sl['cluster']}")
+            pick_idx=st.selectbox("Pick a slot to book", list(range(len(labels))), format_func=lambda i: labels[i])
 
             if st.button("Book selected slot (updates that run only)"):
                 chosen = slots[pick_idx]
@@ -900,11 +888,11 @@ else:
                 clusters = st.session_state.clusters
                 routes   = st.session_state.routes
 
-                # add candidate to that cluster
+                # Append candidate to global points/labels (assign to that cluster)
                 clusters["points"].append(cand)
                 clusters["labels"].append(target_cluster)
 
-                # recompute ONLY that cluster
+                # RECOMPUTE ONLY THAT CLUSTER’S ROUTE using VRPTW/TSP logic
                 idxs = [i for i, l in enumerate(clusters["labels"]) if int(l) == target_cluster]
                 cl_pts = [clusters["points"][i] for i in idxs]
                 cl_ll  = [(p["lat"], p["lng"]) for p in cl_pts]
@@ -922,27 +910,27 @@ else:
                     else:
                         tws.append(0); twe.append(horizon_sec)
 
-                order_local, arrivals = vrptw_ortools(
-                    cl_ll, svc, tws, twe,
-                    "loop" if route_type_key=="loop" else "path",
-                    float(st.session_state.speed_kmh), int(horizon_sec), time_limit_sec=12
-                )
-                if not order_local:
-                    order_local, arrivals = vrptw_greedy(
+                if enforce_windows:
+                    order_local, arrivals = solve_with_time_windows(
                         cl_ll, svc, tws, twe,
                         "loop" if route_type_key=="loop" else "path",
-                        float(st.session_state.speed_kmh), int(horizon_sec)
+                        float(st.session_state.speed_kmh), int(horizon_sec),
+                        time_limit_sec=10
                     )
                     if not order_local:
-                        order_local = tsp_fast_order(cl_ll, "loop" if route_type_key=="loop" else "path")
+                        # Fallback: TSP
+                        order_local = tsp_solve_order(cl_ll, route_type="loop" if route_type_key=="loop" else "path")
                         arrivals = []
+                else:
+                    order_local = tsp_solve_order(cl_ll, route_type="loop" if route_type_key=="loop" else "path")
+                    arrivals = []
 
                 order_global  = [idxs[i] for i in order_local]
                 ordered_points= [clusters["points"][i] for i in order_global]
                 seq_ll_final  = [(p["lat"], p["lng"]) for p in ordered_points]
                 poly, steps   = compute_google_route_polyline_chunked(seq_ll_final)
 
-                # replace only that run
+                # Replace only that run, keep others intact
                 replaced = False
                 for i, rr in enumerate(routes):
                     if int(rr.get("cluster", -1)) == target_cluster and int(rr.get("run_id",1)) == chosen_run_id:
@@ -954,7 +942,7 @@ else:
                     routes.append({"cluster": target_cluster, "run_id": chosen_run_id, "order": order_global,
                                    "ordered_points": ordered_points, "poly_points": poly, "steps": steps, "arrivals": arrivals})
 
-                # update UI stats
+                # Update size & centroid for UI
                 sizes = clusters.get("sizes", {})
                 sizes[target_cluster] = len([1 for l in clusters["labels"] if int(l)==target_cluster])
                 clusters["sizes"] = sizes
@@ -966,9 +954,11 @@ else:
                 centroids[target_cluster] = {"cluster": target_cluster, "lat": lat_mean, "lng": lng_mean}
                 clusters["centroids"] = centroids
 
+                # Persist & refresh
                 st.session_state.clusters = clusters
                 st.session_state.routes   = routes
                 st.session_state.new_candidate = None
                 st.session_state.slot_options = None
                 st.session_state.map_version += 1
-                st.success(f"Booked slot • Cluster {target_cluster} updated.")
+                st.success(f"Booked slot • Cluster {target_cluster} run {chosen_run_id} updated. Map will refresh.")
+                st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
